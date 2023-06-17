@@ -1,0 +1,169 @@
+from google.colab import drive
+drive.mount('/content/drive')
+  
+pip install konlpy
+  
+import pandas as pd
+import numpy as np
+from gensim.models import Word2Vec
+from konlpy.tag import Okt
+from sklearn.preprocessing import LabelEncoder, OneHotEncoder
+from tensorflow.keras.preprocessing.sequence import pad_sequences
+from sklearn.model_selection import train_test_split
+from keras.models import Sequential
+from keras.layers import SimpleRNN, Dense
+from sklearn.metrics import f1_score
+from keras.layers import Conv1D, GlobalMaxPooling1D
+from sklearn.metrics import accuracy_score
+from keras.callbacks import ModelCheckpoint
+
+# Word2Vec 모델 로드
+model = Word2Vec.load('/content/drive/MyDrive/논문/word2vec_model.ko')
+
+excel_file_path = '/content/drive/MyDrive/논문/data_all.xlsx'
+df = pd.read_excel(excel_file_path)
+
+# 원본 변경 방지를 위한 copy본 작성
+df = df.copy()
+df['적요'] = df['적요'].apply(str)
+
+okt = Okt()
+
+sentences_2010 = []
+labels_2010 = []
+sentences_2011 = []
+labels_2011 = []
+
+for index, row in df.iterrows():
+    if row['연도'] == 2010:
+        sentence = row['적요']
+        if pd.isna(sentence) or sentence is None:
+            continue
+        tokens = okt.morphs(sentence)
+        sentences_2010.append(tokens)
+        label = row['계정']
+        if pd.isna(label) or label is None:
+            continue
+        labels_2010.append(label)
+    elif row['연도'] == 2011:
+        sentence = row['적요']
+        if pd.isna(sentence) or sentence is None:
+            continue
+        tokens = okt.morphs(sentence)
+        sentences_2011.append(tokens)
+        label = row['계정']
+        if pd.isna(label) or label is None:
+            continue
+        labels_2011.append(label)
+
+# Word2Vec 벡터화
+vectorized_sentences_2010 = []
+for sentence in sentences_2010:
+    vec_sentence = []
+    for word in sentence:
+        if word in model.wv:
+            vec = model.wv[word]
+            vec_sentence.append(vec)
+    vectorized_sentences_2010.append(vec_sentence)
+
+vectorized_sentences_2011 = []
+for sentence in sentences_2011:
+    vec_sentence = []
+    for word in sentence:
+        if word in model.wv:
+            vec = model.wv[word]
+            vec_sentence.append(vec)
+    vectorized_sentences_2011.append(vec_sentence)
+
+# 패딩 처리
+vectorized_sentences_2010 = pad_sequences(vectorized_sentences_2010, dtype='float32', padding='post')
+vectorized_sentences_2011 = pad_sequences(vectorized_sentences_2011, dtype='float32', padding='post')
+
+# 레이블 인코딩
+label_encoder = LabelEncoder()
+
+# Unknown category for unseen labels in test data
+labels_2010_with_unknown = labels_2010.copy()
+labels_2010_with_unknown.append('Unknown')
+
+integer_encoded_2010 = label_encoder.fit_transform(labels_2010_with_unknown)
+
+# 원-핫 인코딩
+onehot_encoder = OneHotEncoder(sparse_output=False, handle_unknown='ignore') # handle_unknown='ignore' 추가
+integer_encoded_2010 = integer_encoded_2010[:-1].reshape(len(labels_2010), 1)  # 'Unknown'을 제외하고 reshape
+onehot_encoded_2010 = onehot_encoder.fit_transform(integer_encoded_2010)
+
+# 데이터 분할
+x_train, x_test, y_train, y_test = train_test_split(vectorized_sentences_2010, onehot_encoded_2010, test_size=0.2, random_state=42)
+x_train, x_val, y_train, y_val = train_test_split(x_train, y_train, test_size=0.2, random_state=42)
+
+# For labels in 2011
+integer_encoded_2011 = []
+for label in labels_2011:
+    try:
+        encoded = label_encoder.transform([label])
+        integer_encoded_2011.append(encoded[0])
+    except ValueError:
+        # Assign 'Unknown' category for unseen labels
+        encoded = label_encoder.transform(['Unknown'])
+        integer_encoded_2011.append(encoded[0])
+
+integer_encoded_2011 = np.array(integer_encoded_2011).reshape(len(integer_encoded_2011), 1)
+onehot_encoded_2011 = onehot_encoder.transform(integer_encoded_2011)
+
+# 모델 생성 및 학습
+num_classes = onehot_encoded_2010.shape[1]
+input_shape = vectorized_sentences_2010.shape[1:]
+
+cnn_model = Sequential()
+cnn_model.add(Conv1D(128, 3, activation='relu', input_shape=input_shape))
+cnn_model.add(GlobalMaxPooling1D())
+cnn_model.add(Dense(num_classes, activation='softmax'))
+cnn_model.compile(loss='categorical_crossentropy', optimizer='adam', metrics=['accuracy'])
+
+# ModelCheckpoint 콜백 정의
+checkpoint = ModelCheckpoint('best_model.h5', save_weights_only=True, save_best_only=True, verbose=0) # verbose 0 출력 없음, 1 에폭마다 출력, 2 간단하게 한 줄로 출력
+
+history = cnn_model.fit(x_train, y_train, epochs=20, batch_size=64, validation_data=(x_val, y_val), callbacks = [checkpoint], verbose = 0)
+
+last_epoch_loss = history.history['loss'][-1]
+last_epoch_accuracy = history.history['accuracy'][-1]
+last_epoch_val_loss = history.history['val_loss'][-1]
+last_epoch_val_accuracy = history.history['val_accuracy'][-1]
+
+print("Last Epoch Loss:", last_epoch_loss)
+print("Last Epoch Accuracy:", last_epoch_accuracy)
+print("Last Epoch Validation Loss:", last_epoch_val_loss)
+print("Last Epoch Validation Accuracy:", last_epoch_val_accuracy)
+
+# 2011년 데이터 예측
+vectorized_sentences_2011 = pad_sequences(vectorized_sentences_2011, maxlen=vectorized_sentences_2010.shape[1], dtype='float32', padding='post')
+predictions_2011 = cnn_model.predict(vectorized_sentences_2011)
+
+# 예측 결과 디코딩
+predicted_labels_2011 = np.argmax(predictions_2011, axis=1)
+
+# 실제 레이블 값을 1차원으로 변환
+true_labels_2011 = np.argmax(onehot_encoded_2011, axis=1)
+
+# 예측된 계정값과 실제 계정값을 함께 DataFrame으로 생성
+result_df = pd.DataFrame({
+    '적요': [' '.join(sentence) for sentence in sentences_2011],
+    '예측된 계정값': label_encoder.inverse_transform(predicted_labels_2011),
+    '실제 계정값': label_encoder.inverse_transform(true_labels_2011)
+})
+
+# 실제 데이터에 대해 예측한 값에 대한 Accuracy Score 출력
+
+accuracy = accuracy_score(true_labels_2011, predicted_labels_2011)
+print("Test Accuracy: ", accuracy)
+
+# f1-score 계산
+f1 = f1_score(true_labels_2011, predicted_labels_2011, average='weighted')  # 'weighted': 레이블의 불균형을 고려
+print("Test F1 Score: ", f1)
+
+# 결과를 출력
+# print(result_df)
+
+# 결과를 엑셀 파일로 저장
+# result_df.to_excel('/content/drive/MyDrive/논문/prediction_results_cnn_2010_2011.xlsx', index=False)
